@@ -19,6 +19,7 @@
 namespace gpu { namespace gl45 {
     
 using namespace gpu::gl;
+using TextureWeakPointer = std::weak_ptr<Texture>;
 
 class GL45Backend : public GLBackend {
     using Parent = GLBackend;
@@ -31,69 +32,137 @@ public:
 
     class GL45Texture : public GLTexture {
         using Parent = GLTexture;
+        using TextureTypeFormat = std::pair<GLenum, GLenum>;
+        using PageDimensions = std::vector<uvec3>;
+        using PageDimensionsMap = std::map<TextureTypeFormat, PageDimensions>;
+        static PageDimensionsMap pageDimensionsByFormat;
+        static Mutex pageDimensionsMutex;
+
+        static bool isSparseEligible(const Texture& texture);
+        static PageDimensions getPageDimensionsForFormat(const TextureTypeFormat& typeFormat);
+        static PageDimensions getPageDimensionsForFormat(GLenum type, GLenum format);
         static GLuint allocate(const Texture& texture);
         static const uint32_t DEFAULT_PAGE_DIMENSION = 128;
         static const uint32_t DEFAULT_MAX_SPARSE_LEVEL = 0xFFFF;
 
-    public:
-        GL45Texture(const std::weak_ptr<GLBackend>& backend, const Texture& texture, GLuint externalId);
-        GL45Texture(const std::weak_ptr<GLBackend>& backend, const Texture& texture, bool transferrable);
-        ~GL45Texture();
-
-        void postTransfer() override;
-
-        struct SparseInfo {
-            SparseInfo(GL45Texture& texture);
-            void maybeMakeSparse();
-            void update();
-            uvec3 getPageCounts(const uvec3& dimensions) const;
-            uint32_t getPageCount(const uvec3& dimensions) const;
-            uint32_t getSize() const;
-
-            GL45Texture& texture;
-            bool sparse { false };
-            uvec3 pageDimensions { DEFAULT_PAGE_DIMENSION };
-            GLuint maxSparseLevel { DEFAULT_MAX_SPARSE_LEVEL };
-            uint32_t allocatedPages { 0 };
-            uint32_t maxPages { 0 };
-            uint32_t pageBytes { 0 };
-            GLint pageDimensionsIndex { 0 };
-        };
-
     protected:
-        void updateMips() override;
-        void stripToMip(uint16_t newMinMip);
-        void startTransfer() override;
-        bool continueTransfer() override;
-        void finishTransfer() override;
-        void incrementalTransfer(const uvec3& size, const gpu::Texture::PixelsPointer& mip, std::function<void(const ivec3& offset, const uvec3& size)> f) const;
-        void transferMip(uint16_t mipLevel, uint8_t face = 0) const;
-        void allocateMip(uint16_t mipLevel, uint8_t face = 0) const;
-        void allocateStorage() const override;
-        void updateSize() const override;
-        void syncSampler() const override;
+        GL45Texture(const std::weak_ptr<GLBackend>& backend, const Texture& texture);
         void generateMips() const override;
-        void withPreservedTexture(std::function<void()> f) const override;
-        void derez();
-
-        SparseInfo _sparseInfo;
-        uint16_t _mipOffset { 0 };
+        void copyMipFromTexture(uint16_t sourceMip, uint16_t targetMip) const;
+        virtual void syncSampler() const;
         friend class GL45Backend;
     };
 
+    //
+    // Textures that have fixed allocation sizes and cannot be managed at runtime
+    //
+
+    class GL45FixedAllocationTexture : public GL45Texture {
+        using Parent = GL45Texture;
+        friend class GL45Backend;
+
+    public:
+        GL45FixedAllocationTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture);
+        ~GL45FixedAllocationTexture();
+
+    protected:
+        uint32 size() const override { return _size; }
+        void allocateStorage() const;
+        virtual void syncSampler() const;
+        const uint32 _size { 0 };
+    };
+
+    class GL45AttachmentTexture : public GL45FixedAllocationTexture {
+        using Parent = GL45FixedAllocationTexture;
+        friend class GL45Backend;
+    protected:
+        GL45AttachmentTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture);
+        ~GL45AttachmentTexture();
+    };
+
+    class GL45StrictResourceTexture : public GL45FixedAllocationTexture {
+        using Parent = GL45FixedAllocationTexture;
+        friend class GL45Backend;
+    protected:
+        GL45StrictResourceTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture);
+    };
+
+    //
+    // Textures that can be managed at runtime to increase or decrease their memory load
+    //
+
+    class GL45VariableAllocationTexture : public GL45Texture {
+        using Parent = GL45Texture;
+        friend class GL45Backend;
+    protected:
+        static const uvec3 INITIAL_MIP_TRANSFER_DIMENSIONS;
+        GL45VariableAllocationTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture);
+        virtual void promote() = 0;
+        virtual void demote() = 0;
+    };
+
+    class GL45ResourceTexture : public GL45VariableAllocationTexture {
+        using Parent = GL45VariableAllocationTexture;
+        friend class GL45Backend;
+    protected:
+        GL45ResourceTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture);
+        uint32 size() const override { return 0; }
+        void syncSampler() const override;
+
+        void promote() override;
+        void demote() override;
+
+        void allocateStorage(uint16 mip) const;
+        void reallocateStorage() const;
+        void copyMipsFromTexture() const;
+
+    private:
+        uint32 _size { 0 };
+        mutable uint16 _allocatedMip { 0 };
+        uint16 _maxAllocatedMip { 0 };
+        uint16 _populatedMip { 0 };
+    };
+
+    class GL45SparseResourceTexture : public GL45VariableAllocationTexture {
+        using Parent = GL45VariableAllocationTexture;
+        friend class GL45Backend;
+    protected:
+        GL45SparseResourceTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture);
+        ~GL45SparseResourceTexture();
+        uint32 size() const override { return _allocatedPages * _pageBytes; }
+        void promote() override;
+        void demote() override;
+
+#if 0
+        struct SparseInfo {
+            SparseInfo(GL45Texture& texture);
+            void update();
+            void allocateToMip(uint16_t mipLevel);
+
+            uint16_t allocatedMip { INVALID_MIP };
+            uint32_t maxPages { 0 };
+            GLint pageDimensionsIndex { 0 };
+        };
+#endif
+
+    private:
+        uvec3 getPageCounts(const uvec3& dimensions) const;
+        uint32_t getPageCount(const uvec3& dimensions) const;
+
+        uint32_t _allocatedPages { 0 };
+        uint32_t _pageBytes { 0 };
+        uvec3 _pageDimensions { DEFAULT_PAGE_DIMENSION };
+        GLuint _maxSparseLevel { DEFAULT_MAX_SPARSE_LEVEL };
+    };
 
 protected:
-    void recycle() const override;
-    void derezTextures() const;
-
     GLuint getFramebufferID(const FramebufferPointer& framebuffer) override;
     GLFramebuffer* syncGPUObject(const Framebuffer& framebuffer) override;
 
     GLuint getBufferID(const Buffer& buffer) override;
     GLBuffer* syncGPUObject(const Buffer& buffer) override;
 
-    GLuint getTextureID(const TexturePointer& texture, bool needTransfer = true) override;
-    GLTexture* syncGPUObject(const TexturePointer& texture, bool sync = true) override;
+    GLTexture* syncGPUObject(const TexturePointer& texture) override;
 
     GLuint getQueryID(const QueryPointer& query) override;
     GLQuery* syncGPUObject(const Query& query) override;
@@ -127,4 +196,44 @@ protected:
 Q_DECLARE_LOGGING_CATEGORY(gpugl45logging)
 
 
+#endif
+
+
+#if 0
+class GL45ResourceTextureCompare {
+public:
+    bool operator() (const TextureWeakPointer&, const TextureWeakPointer&) {
+        return true;
+    }
+};
+std::priority_queue<TextureWeakPointer, GL45ResourceTextureCompare> _promoteQueue;
+#endif
+
+#if 0
+void postTransfer() override;
+virtual size_t getCurrentGpuSize() const override;
+virtual size_t getTargetGpuSize() const override;
+
+    protected:
+        void stripToMip(uint16_t newMinMip);
+        void startTransfer() override;
+        bool continueTransfer() override;
+        void finishTransfer() override;
+        void incrementalTransfer(const uvec3& size, const gpu::Texture::PixelsPointer& mip, std::function<void(const ivec3& offset, const uvec3& size)> f) const;
+        void transferMip(uint16_t mipLevel, uint8_t face = 0) const;
+        void allocateMip(uint16_t mipLevel, uint8_t face = 0) const;
+        void allocateStorage() const override;
+        void updateSize() const override;
+        void syncSampler() const override;
+        void generateMips() const override;
+        void withPreservedTexture(std::function<void()> f) const override;
+        bool derezable() const override;
+        void derez() override;
+        std::pair<size_t, bool> preDerez() override; 
+        size_t getMipByteCount(uint16_t mip) const override;
+
+        SparseInfo _sparseInfo;
+        uint16_t _mipOffset { 0 };
+        uint16_t _targetMinMip { 0 };
+        uint16_t _populatedMip { INVALID_MIP };
 #endif

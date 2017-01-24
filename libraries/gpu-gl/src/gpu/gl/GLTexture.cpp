@@ -10,15 +10,13 @@
 
 #include <NumericalConstants.h>
 
-#include "GLTextureTransfer.h"
 #include "GLBackend.h"
 
 using namespace gpu;
 using namespace gpu::gl;
 
-std::shared_ptr<GLTextureTransferHelper> GLTexture::_textureTransferHelper;
 
-const GLenum GLTexture::CUBE_FACE_LAYOUT[6] = {
+const GLenum GLTexture::CUBE_FACE_LAYOUT[GLTexture::TEXTURE_CUBE_NUM_FACES] = {
     GL_TEXTURE_CUBE_MAP_POSITIVE_X, GL_TEXTURE_CUBE_MAP_NEGATIVE_X,
     GL_TEXTURE_CUBE_MAP_POSITIVE_Y, GL_TEXTURE_CUBE_MAP_NEGATIVE_Y,
     GL_TEXTURE_CUBE_MAP_POSITIVE_Z, GL_TEXTURE_CUBE_MAP_NEGATIVE_Z
@@ -67,6 +65,17 @@ GLenum GLTexture::getGLTextureType(const Texture& texture) {
 }
 
 
+uint8_t GLTexture::getFaceCount(GLenum target) {
+    switch (target) {
+        case GL_TEXTURE_2D:
+            return TEXTURE_2D_NUM_FACES;
+        case GL_TEXTURE_CUBE_MAP:
+            return TEXTURE_CUBE_NUM_FACES;
+        default:
+            Q_UNREACHABLE();
+            break;
+    }
+}
 const std::vector<GLenum>& GLTexture::getFaceTargets(GLenum target) {
     static std::vector<GLenum> cubeFaceTargets {
         GL_TEXTURE_CUBE_MAP_POSITIVE_X, GL_TEXTURE_CUBE_MAP_NEGATIVE_X,
@@ -89,16 +98,48 @@ const std::vector<GLenum>& GLTexture::getFaceTargets(GLenum target) {
     return faceTargets;
 }
 
+GLTexture::GLTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture, GLuint id) :
+    GLObject(backend, texture, id),
+    _source(texture.source()),
+    _target(getGLTextureType(texture))
+{
+    Backend::setGPUObject(texture, this);
+}
+
+GLTexture::~GLTexture() {
+    auto backend = _backend.lock();
+    if (backend && _id) {
+        backend->releaseTexture(_id, 0);
+    }
+}
+
+
+GLExternalTexture::GLExternalTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture, GLuint id) 
+    : Parent(backend, texture, id) { }
+
+GLExternalTexture::~GLExternalTexture() {
+    auto backend = _backend.lock();
+    if (backend) {
+        auto recycler = _gpuObject.getExternalRecycler();
+        if (recycler) {
+            backend->releaseExternalTexture(_id, recycler);
+        } else {
+            qWarning() << "No recycler available for texture " << _id << " possible leak";
+        }
+        const_cast<GLuint&>(_id) = 0;
+    }
+}
+
+#if 0
 // Default texture memory = GPU total memory - 2GB
 #define GPU_MEMORY_RESERVE_BYTES MB_TO_BYTES(2048)
 // Minimum texture memory = 1GB
-#define TEXTURE_MEMORY_MIN_BYTES MB_TO_BYTES(1024)
+#define TEXTURE_MEMORY_MIN_BYTES MB_TO_BYTES(256)
 
-
-float GLTexture::getMemoryPressure() {
+size_t GLTexture::getAllowedTextureSize() {
     // Check for an explicit memory limit
     auto availableTextureMemory = Texture::getAllowedGPUMemoryUsage();
-    
+
 
     // If no memory limit has been set, use a percentage of the total dedicated memory
     if (!availableTextureMemory) {
@@ -114,9 +155,14 @@ float GLTexture::getMemoryPressure() {
         availableTextureMemory = TEXTURE_MEMORY_MIN_BYTES;
 #endif
     }
+    return availableTextureMemory;
 
+}
+
+float GLTexture::getMemoryPressure() {
     // Return the consumed texture memory divided by the available texture memory.
     auto consumedGpuMemory = Context::getTextureGPUMemoryUsage() - Context::getTextureGPUFramebufferMemoryUsage();
+    auto availableTextureMemory = getAllowedTextureSize();
     float memoryPressure = (float)consumedGpuMemory / (float)availableTextureMemory;
     static Context::Size lastConsumedGpuMemory = 0;
     if (memoryPressure > 1.0f && lastConsumedGpuMemory != consumedGpuMemory) {
@@ -125,7 +171,6 @@ float GLTexture::getMemoryPressure() {
     }
     return memoryPressure;
 }
-
 
 // Create the texture and allocate storage
 GLTexture::GLTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture, GLuint id, bool transferrable) :
@@ -140,12 +185,11 @@ GLTexture::GLTexture(const std::weak_ptr<GLBackend>& backend, const Texture& tex
     _virtualSize(texture.evalTotalSize()),
     _transferrable(transferrable)
 {
-    auto strongBackend = _backend.lock();
-    strongBackend->recycle();
     Backend::incrementTextureGPUCount();
     Backend::updateTextureGPUVirtualMemoryUsage(0, _virtualSize);
     Backend::setGPUObject(texture, this);
 }
+
 
 GLTexture::GLTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture, GLuint id) :
     GLObject(backend, texture, id),
@@ -161,38 +205,8 @@ GLTexture::GLTexture(const std::weak_ptr<GLBackend>& backend, const Texture& tex
     _transferrable(false) 
 {
     Backend::setGPUObject(texture, this);
-
-    // FIXME Is this necessary?
-    //withPreservedTexture([this] {
-    //    syncSampler();
-    //    if (_gpuObject.isAutogenerateMips()) {
-    //        generateMips();
-    //    }
-    //});
 }
 
-GLTexture::~GLTexture() {
-    auto backend = _backend.lock();
-    if (backend) {
-        if (_external) {
-            auto recycler = _gpuObject.getExternalRecycler();
-            if (recycler) {
-                backend->releaseExternalTexture(_id, recycler);
-            } else {
-                qWarning() << "No recycler available for texture " << _id << " possible leak";
-            }
-        } else if (_id) {
-            // WARNING!  Sparse textures do not use this code path.  See GL45BackendTexture for 
-            // the GL45Texture destructor for doing any required work tracking GPU stats
-            backend->releaseTexture(_id, _size);
-        }
-
-        if (!_external && !_transferrable) {
-            Backend::updateTextureGPUFramebufferMemoryUsage(_size, 0);
-        }
-    }
-    Backend::updateTextureGPUVirtualMemoryUsage(_virtualSize, 0);
-}
 
 void GLTexture::createTexture() {
     withPreservedTexture([&] {
@@ -301,4 +315,20 @@ void GLTexture::finishTransfer() {
         generateMips();
     }
 }
+size_t GLTexture::getCurrentGpuSize() const {
+    return getVirtualGpuSize();
+}
+
+size_t GLTexture::getTargetGpuSize() const {
+    return getVirtualGpuSize();
+}
+
+size_t GLTexture::getVirtualGpuSize() const {
+    return _virtualSize;
+}
+
+size_t GLTexture::getMipByteCount(uint16_t mip) const {
+    return _gpuObject.evalMipSize(mip);
+}
+#endif
 

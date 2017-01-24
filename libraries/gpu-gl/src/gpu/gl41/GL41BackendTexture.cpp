@@ -29,20 +29,97 @@ GLuint GL41Texture::allocate() {
     return result;
 }
 
-GLuint GL41Backend::getTextureID(const TexturePointer& texture, bool transfer) {
-    return GL41Texture::getId<GL41Texture>(*this, texture, transfer);
+GLTexture* GL41Backend::syncGPUObject(const TexturePointer& texturePointer) {
+    if (!texturePointer) {
+        return nullptr;
+    }
+    const Texture& texture = *texturePointer;
+    if (TextureUsageType::EXTERNAL == texture.getUsageType()) {
+        return Parent::syncGPUObject(texturePointer);
+    }
+
+    if (!texture.isDefined()) {
+        // NO texture definition yet so let's avoid thinking
+        return nullptr;
+    }
+
+    // If the object hasn't been created, or the object definition is out of date, drop and re-create
+    GL41Texture* object = Backend::getGPUObject<GL41Texture>(texture);
+    if (!object || object->_storageStamp < texture.getStamp()) {
+        // This automatically any previous texture
+        object = new GL41Texture(shared_from_this(), texture);
+    }
+
+    // FIXME internalize to GL41Texture 'sync' function
+    if (object->isOutdated()) {
+        object->withPreservedTexture([&] {
+            if (object->_contentStamp < texture.getDataStamp()) {
+                // FIXME implement synchronous texture transfer here
+                object->syncContent();
+            }
+
+            if (object->_samplerStamp < texture.getSamplerStamp()) {
+                object->syncSampler();
+            }
+        });
+    }
+
+    return object;
 }
 
-GLTexture* GL41Backend::syncGPUObject(const TexturePointer& texture, bool transfer) {
-    return GL41Texture::sync<GL41Texture>(*this, texture, transfer);
+GL41Texture::GL41Texture(const std::weak_ptr<GLBackend>& backend, const Texture& texture) 
+    : GLTexture(backend, texture, allocate()), _storageStamp { texture.getStamp() }, _size(texture.evalTotalSize()) {
+
+    withPreservedTexture([&] {
+        GLTexelFormat texelFormat = GLTexelFormat::evalGLTexelFormat(_gpuObject.getTexelFormat());
+        const Sampler& sampler = _gpuObject.getSampler();
+        auto minMip = sampler.getMinMip();
+        auto maxMip = sampler.getMaxMip();
+        for (uint16_t l = minMip; l <= maxMip; l++) {
+            // Get the mip level dimensions, accounting for the downgrade level
+            Vec3u dimensions = _gpuObject.evalMipDimensions(l);
+            for (GLenum target : getFaceTargets(_target)) {
+                glTexImage2D(target, l - minMip, texelFormat.internalFormat, dimensions.x, dimensions.y, 0, texelFormat.format, texelFormat.type, NULL);
+                (void)CHECK_GL_ERROR();
+            }
+        }
+    });
 }
 
-GL41Texture::GL41Texture(const std::weak_ptr<GLBackend>& backend, const Texture& texture, GLuint externalId) 
-    : GLTexture(backend, texture, externalId) { 
+GL41Texture::~GL41Texture() {
+
 }
 
-GL41Texture::GL41Texture(const std::weak_ptr<GLBackend>& backend, const Texture& texture, bool transferrable) 
-    : GLTexture(backend, texture, allocate(), transferrable) {
+bool GL41Texture::isOutdated() const {
+    if (_samplerStamp <= _gpuObject.getSamplerStamp()) {
+        return true;
+    }
+    if (TextureUsageType::RESOURCE == _gpuObject.getUsageType() && _contentStamp <= _gpuObject.getDataStamp()) {
+        return true;
+    }
+    return false;
+}
+
+void GL41Texture::withPreservedTexture(std::function<void()> f) const {
+    GLint boundTex = -1;
+    switch (_target) {
+        case GL_TEXTURE_2D:
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &boundTex);
+            break;
+
+        case GL_TEXTURE_CUBE_MAP:
+            glGetIntegerv(GL_TEXTURE_BINDING_CUBE_MAP, &boundTex);
+            break;
+
+        default:
+            qFatal("Unsupported texture type");
+    }
+    (void)CHECK_GL_ERROR();
+
+    glBindTexture(_target, _texture);
+    f();
+    glBindTexture(_target, boundTex);
+    (void)CHECK_GL_ERROR();
 }
 
 void GL41Texture::generateMips() const {
@@ -52,28 +129,41 @@ void GL41Texture::generateMips() const {
     (void)CHECK_GL_ERROR();
 }
 
-void GL41Texture::allocateStorage() const {
-    GLTexelFormat texelFormat = GLTexelFormat::evalGLTexelFormat(_gpuObject.getTexelFormat());
-    glTexParameteri(_target, GL_TEXTURE_BASE_LEVEL, 0);
-    (void)CHECK_GL_ERROR();
-    glTexParameteri(_target, GL_TEXTURE_MAX_LEVEL, _maxMip - _minMip);
-    (void)CHECK_GL_ERROR();
-    if (GLEW_VERSION_4_2 && !_gpuObject.getTexelFormat().isCompressed()) {
-        // Get the dimensions, accounting for the downgrade level
-        Vec3u dimensions = _gpuObject.evalMipDimensions(_minMip);
-        glTexStorage2D(_target, usedMipLevels(), texelFormat.internalFormat, dimensions.x, dimensions.y);
-        (void)CHECK_GL_ERROR();
-    } else {
-        for (uint16_t l = _minMip; l <= _maxMip; l++) {
-            // Get the mip level dimensions, accounting for the downgrade level
-            Vec3u dimensions = _gpuObject.evalMipDimensions(l);
-            for (GLenum target : getFaceTargets(_target)) {
-                glTexImage2D(target, l - _minMip, texelFormat.internalFormat, dimensions.x, dimensions.y, 0, texelFormat.format, texelFormat.type, NULL);
-                (void)CHECK_GL_ERROR();
-            }
-        }
-    }
+void GL41Texture::syncContent() const {
+    // FIXME actually copy the texture data
+    _contentStamp = _gpuObject.getDataStamp() + 1;
 }
+
+void GL41Texture::syncSampler() const {
+    const Sampler& sampler = _gpuObject.getSampler();
+    const auto& fm = FILTER_MODES[sampler.getFilter()];
+    glTexParameteri(_target, GL_TEXTURE_MIN_FILTER, fm.minFilter);
+    glTexParameteri(_target, GL_TEXTURE_MAG_FILTER, fm.magFilter);
+
+    if (sampler.doComparison()) {
+        glTexParameteri(_target, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_R_TO_TEXTURE);
+        glTexParameteri(_target, GL_TEXTURE_COMPARE_FUNC, COMPARISON_TO_GL[sampler.getComparisonFunction()]);
+    } else {
+        glTexParameteri(_target, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+    }
+
+    glTexParameteri(_target, GL_TEXTURE_WRAP_S, WRAP_MODES[sampler.getWrapModeU()]);
+    glTexParameteri(_target, GL_TEXTURE_WRAP_T, WRAP_MODES[sampler.getWrapModeV()]);
+    glTexParameteri(_target, GL_TEXTURE_WRAP_R, WRAP_MODES[sampler.getWrapModeW()]);
+
+    glTexParameterfv(_target, GL_TEXTURE_BORDER_COLOR, (const float*)&sampler.getBorderColor());
+    glTexParameteri(_target, GL_TEXTURE_BASE_LEVEL, (uint16)sampler.getMipOffset());
+    glTexParameterf(_target, GL_TEXTURE_MIN_LOD, (float)sampler.getMinMip());
+    glTexParameterf(_target, GL_TEXTURE_MAX_LOD, (sampler.getMaxMip() == Sampler::MAX_MIP_LEVEL ? 1000.f : sampler.getMaxMip()));
+    glTexParameterf(_target, GL_TEXTURE_MAX_ANISOTROPY_EXT, sampler.getMaxAnisotropy());
+    _samplerStamp = _gpuObject.getSamplerStamp() + 1;
+}
+
+uint32 GL41Texture::size() const {
+    return _size;
+}
+
+#if 0
 
 void GL41Texture::updateSize() const {
     setSize(_virtualSize);
@@ -139,27 +229,5 @@ void GL41Texture::startTransfer() {
     }
 }
 
-void GL41Backend::GL41Texture::syncSampler() const {
-    const Sampler& sampler = _gpuObject.getSampler();
-    const auto& fm = FILTER_MODES[sampler.getFilter()];
-    glTexParameteri(_target, GL_TEXTURE_MIN_FILTER, fm.minFilter);
-    glTexParameteri(_target, GL_TEXTURE_MAG_FILTER, fm.magFilter);
 
-    if (sampler.doComparison()) {
-        glTexParameteri(_target, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_R_TO_TEXTURE);
-        glTexParameteri(_target, GL_TEXTURE_COMPARE_FUNC, COMPARISON_TO_GL[sampler.getComparisonFunction()]);
-    } else {
-        glTexParameteri(_target, GL_TEXTURE_COMPARE_MODE, GL_NONE);
-    }
-
-    glTexParameteri(_target, GL_TEXTURE_WRAP_S, WRAP_MODES[sampler.getWrapModeU()]);
-    glTexParameteri(_target, GL_TEXTURE_WRAP_T, WRAP_MODES[sampler.getWrapModeV()]);
-    glTexParameteri(_target, GL_TEXTURE_WRAP_R, WRAP_MODES[sampler.getWrapModeW()]);
-
-    glTexParameterfv(_target, GL_TEXTURE_BORDER_COLOR, (const float*)&sampler.getBorderColor());
-    glTexParameteri(_target, GL_TEXTURE_BASE_LEVEL, (uint16)sampler.getMipOffset());
-    glTexParameterf(_target, GL_TEXTURE_MIN_LOD, (float)sampler.getMinMip());
-    glTexParameterf(_target, GL_TEXTURE_MAX_LOD, (sampler.getMaxMip() == Sampler::MAX_MIP_LEVEL ? 1000.f : sampler.getMaxMip()));
-    glTexParameterf(_target, GL_TEXTURE_MAX_ANISOTROPY_EXT, sampler.getMaxAnisotropy());
-}
-
+#endif

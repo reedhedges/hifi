@@ -306,6 +306,7 @@ void HmdDisplayPlugin::internalPresent() {
             _previewTexture->autoGenerateMips(-1);
         }
         
+#if 0
         if (getGLBackend()->isTextureReady(_previewTexture)) {
             auto viewport = getViewportForSourceSize(uvec2(_previewTexture->getDimensions()));
 
@@ -323,6 +324,7 @@ void HmdDisplayPlugin::internalPresent() {
             _clearPreviewFlag = false;
             swapBuffers();
         }
+#endif
     }
     postPreview();
 

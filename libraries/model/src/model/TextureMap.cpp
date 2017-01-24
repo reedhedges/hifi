@@ -200,7 +200,7 @@ const QImage& image, bool isLinear, bool doCompress) {
     }
 }
 
-#define CPU_MIPMAPS 0
+#define CPU_MIPMAPS 1
 
 void generateMips(gpu::Texture* texture, QImage& image, gpu::Element formatMip) {
 #if CPU_MIPMAPS
@@ -230,7 +230,7 @@ void generateFaceMips(gpu::Texture* texture, QImage& image, gpu::Element formatM
 #endif
 }
 
-gpu::Texture* TextureUsage::process2DTextureColorFromImage(const QImage& srcImage, const std::string& srcImageName, bool isLinear, bool doCompress, bool generateMips) {
+gpu::Texture* TextureUsage::process2DTextureColorFromImage(const QImage& srcImage, const std::string& srcImageName, bool isLinear, bool doCompress, bool generateMips, bool isStrict) {
     PROFILE_RANGE(resource_parse, "process2DTextureColorFromImage");
     bool validAlpha = false;
     bool alphaAsMask = true;
@@ -243,7 +243,11 @@ gpu::Texture* TextureUsage::process2DTextureColorFromImage(const QImage& srcImag
         gpu::Element formatMip;
         defineColorTexelFormats(formatGPU, formatMip, image, isLinear, doCompress);
 
-        theTexture = (gpu::Texture::create2D(formatGPU, image.width(), image.height(), gpu::Sampler(gpu::Sampler::FILTER_MIN_MAG_MIP_LINEAR)));
+        if (isStrict) {
+            theTexture = (gpu::Texture::createStrict(formatGPU, image.width(), image.height(), gpu::Sampler(gpu::Sampler::FILTER_MIN_MAG_MIP_LINEAR)));
+        } else {
+            theTexture = (gpu::Texture::create2D(formatGPU, image.width(), image.height(), gpu::Sampler(gpu::Sampler::FILTER_MIN_MAG_MIP_LINEAR)));
+        }
         theTexture->setSource(srcImageName);
         auto usage = gpu::Texture::Usage::Builder().withColor();
         if (validAlpha) {
@@ -264,10 +268,13 @@ gpu::Texture* TextureUsage::process2DTextureColorFromImage(const QImage& srcImag
     return theTexture;
 }
 
+gpu::Texture* TextureUsage::createStrict2DTextureFromImage(const QImage& srcImage, const std::string& srcImageName) {
+    return process2DTextureColorFromImage(srcImage, srcImageName, false, false, true, true);
+}
+
 gpu::Texture* TextureUsage::create2DTextureFromImage(const QImage& srcImage, const std::string& srcImageName) {
     return process2DTextureColorFromImage(srcImage, srcImageName, false, false, true);
 }
-
 
 gpu::Texture* TextureUsage::createAlbedoTextureFromImage(const QImage& srcImage, const std::string& srcImageName) {
     return process2DTextureColorFromImage(srcImage, srcImageName, false, true, true);
