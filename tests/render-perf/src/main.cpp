@@ -424,6 +424,9 @@ namespace render {
     }
 }
 
+void modifyPromoteCount(int value);
+    
+
 // Create a simple OpenGL window that renders text in various ways
 class QTestWindow : public QWindow, public AbstractViewStateInterface {
 
@@ -642,6 +645,13 @@ protected:
                 gpu::Texture::setAllowedGPUMemoryUsage(MB_TO_BYTES(64));
                 return;
 
+            case Qt::Key_PageUp:
+                modifyPromoteCount(1);
+                return;
+
+            case Qt::Key_PageDown:
+                modifyPromoteCount(-1);
+                return;
 
             default:
                 break;

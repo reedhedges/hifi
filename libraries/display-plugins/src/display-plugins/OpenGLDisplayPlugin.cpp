@@ -353,7 +353,7 @@ void OpenGLDisplayPlugin::customizeContext() {
             if ((image.width() > 0) && (image.height() > 0)) {
 
                 cursorData.texture.reset(
-                    gpu::Texture::create2D(
+                    gpu::Texture::createStrict(
                         gpu::Element(gpu::VEC4, gpu::NUINT8, gpu::RGBA), 
                         image.width(), image.height(), 
                         gpu::Sampler(gpu::Sampler::FILTER_MIN_MAG_MIP_LINEAR)));

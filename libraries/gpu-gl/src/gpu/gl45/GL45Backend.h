@@ -99,6 +99,12 @@ public:
         GL45VariableAllocationTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture);
         virtual void promote() = 0;
         virtual void demote() = 0;
+        virtual bool canPromote() const;
+        virtual bool canDemote() const;
+
+        uint16 _populatedMip { 0 };
+        mutable uint16 _allocatedMip { 0 };
+        uint16 _maxAllocatedMip { 0 };
     };
 
     class GL45ResourceTexture : public GL45VariableAllocationTexture {
@@ -118,9 +124,6 @@ public:
 
     private:
         uint32 _size { 0 };
-        mutable uint16 _allocatedMip { 0 };
-        uint16 _maxAllocatedMip { 0 };
-        uint16 _populatedMip { 0 };
     };
 
     class GL45SparseResourceTexture : public GL45VariableAllocationTexture {
@@ -156,6 +159,8 @@ public:
     };
 
 protected:
+    void recycle() const override;
+
     GLuint getFramebufferID(const FramebufferPointer& framebuffer) override;
     GLFramebuffer* syncGPUObject(const Framebuffer& framebuffer) override;
 

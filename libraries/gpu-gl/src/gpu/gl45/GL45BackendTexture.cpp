@@ -80,6 +80,37 @@ GL45Texture::PageDimensions GL45Texture::getPageDimensionsForFormat(GLenum targe
     return getPageDimensionsForFormat({ target, format });
 }
 
+static std::list<TextureWeakPointer> variableAllocationTextures;
+static std::atomic<int> promoteCount;
+
+void modifyPromoteCount(int value) {
+    promoteCount.fetch_add(value);
+}
+
+int getPromoteCount() {
+    return promoteCount.exchange(0);
+}
+
+void GL45Backend::recycle() const {
+    Parent::recycle();
+    int promoteCount = getPromoteCount();
+    if (0 != promoteCount) {
+        qCDebug(gpugl45logging) << promoteCount;
+        auto itr = variableAllocationTextures.begin();
+        while (itr != variableAllocationTextures.end()) {
+            auto texturePointer = itr->lock();
+            if (!texturePointer) {
+                itr = variableAllocationTextures.erase(itr);
+                continue;
+            }
+            ++itr;
+            GL45VariableAllocationTexture* object = Backend::getGPUObject<GL45VariableAllocationTexture>(*texturePointer);
+            Q_ASSERT(object);
+            object->promote();
+        }
+    }
+}
+
 GLTexture* GL45Backend::syncGPUObject(const TexturePointer& texturePointer) {
     if (!texturePointer) {
         return nullptr;
@@ -103,15 +134,21 @@ GLTexture* GL45Backend::syncGPUObject(const TexturePointer& texturePointer) {
                 break;
 
             case TextureUsageType::STRICT_RESOURCE:
-                object = new GL45ResourceTexture(shared_from_this(), texture);
+                qCDebug(gpugllogging) << "Strict texture " << texture.source().c_str();
+                object = new GL45StrictResourceTexture(shared_from_this(), texture);
                 break;
 
             case TextureUsageType::RESOURCE:
+                GL45VariableAllocationTexture* varObject { nullptr };
                 if (isTextureManagementSparseEnabled() && GL45Texture::isSparseEligible(texture)) {
-                    object = new GL45SparseResourceTexture(shared_from_this(), texture);
+                    varObject = new GL45SparseResourceTexture(shared_from_this(), texture);
                 } else {
-                    object = new GL45ResourceTexture(shared_from_this(), texture);
+                    varObject = new GL45ResourceTexture(shared_from_this(), texture);
                 }
+                if (varObject->canPromote() || varObject->canDemote()) {
+                    variableAllocationTextures.push_back(texturePointer);
+                }
+                object = varObject;
                 break;
 
             default:
@@ -277,6 +314,14 @@ const uvec3 GL45VariableAllocationTexture::INITIAL_MIP_TRANSFER_DIMENSIONS { 64,
 GL45VariableAllocationTexture::GL45VariableAllocationTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture) : GL45Texture(backend, texture) {
 }
 
+bool GL45VariableAllocationTexture::canPromote() const {
+    return _populatedMip > 0;
+}
+
+bool GL45VariableAllocationTexture::canDemote() const {
+    return _allocatedMip < _maxAllocatedMip;
+}
+
 // Managed size resource textures
 
 GL45ResourceTexture::GL45ResourceTexture(const std::weak_ptr<GLBackend>& backend, const Texture& texture) : GL45VariableAllocationTexture(backend, texture) {
@@ -356,6 +401,7 @@ void GL45ResourceTexture::promote() {
     --_populatedMip;
     Q_ASSERT(_populatedMip >= _allocatedMip);
     copyMipFromTexture(_populatedMip, _populatedMip - _allocatedMip);
+    syncSampler();
 }
 
 void GL45ResourceTexture::demote() {
